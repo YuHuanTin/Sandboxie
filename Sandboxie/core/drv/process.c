@@ -74,12 +74,17 @@ static void Process_NotifyProcess_Delete(HANDLE ProcessId);
 
 static void Process_Delete(HANDLE ProcessId);
 
+static void Process_ResumeSuspendedChildren(PROCESS *parent);
+
 static void Process_NotifyImage(
     const UNICODE_STRING *FullImageName,
     HANDLE ProcessId, IMAGE_INFO *ImageInfo);
 
 static NTSTATUS Process_CreateUserProcess(
     PROCESS *proc, SYSCALL_ENTRY *syscall_entry, ULONG_PTR *user_args);
+
+// issue #5476: forward declaration, not in WDK headers used by this TU.
+NTKERNELAPI NTSTATUS PsResumeProcess(PEPROCESS Process);
 
 //---------------------------------------------------------------------------
 
@@ -586,6 +591,8 @@ _FX void Process_CreateTerminated(HANDLE ProcessId, ULONG SessionId)
         memzero(proc, sizeof(PROCESS));
         proc->pid = ProcessId;
         proc->pool = Driver_Pool;
+        InitializeListHead(&proc->child_list);
+        InitializeListHead(&proc->parent_link);
         Process_SetTerminated(proc, 1);
 
         KeRaiseIrql(APC_LEVEL, &irql);
@@ -639,6 +646,9 @@ _FX PROCESS *Process_Create(
 
     proc->pid = ProcessId;
     proc->pool = pool;
+
+    InitializeListHead(&proc->child_list);
+    InitializeListHead(&proc->parent_link);
 
     proc->box = Box_Clone(pool, box);
     if (! proc->box) {
@@ -1439,6 +1449,23 @@ _FX BOOLEAN Process_NotifyProcess_Create(
             new_proc->rights_dropped = parent_had_rights_dropped;
             new_proc->forced_process = process_is_forced;
 
+            //
+            // issue #5476: link to sandboxed parent so the driver can
+            // resume this child if the parent dies before SbieSvc does.
+            // skip Start.exe helpers; SbieSvc drives their children.
+            //
+
+            if (! bHostInject && ParentId != Api_ServiceProcessId) {
+
+                PROCESS *parent_proc = map_get(&Process_Map, ParentId);
+                if (parent_proc && !parent_proc->terminated
+                                  && !parent_proc->is_start_exe) {
+                    new_proc->parent_proc = parent_proc;
+                    InsertTailList(
+                        &parent_proc->child_list, &new_proc->parent_link);
+                }
+            }
+
             if (! bHostInject) {
 
                 //
@@ -1593,6 +1620,16 @@ _FX void Process_Delete(HANDLE ProcessId)
 
     Process_FcpDelete(ProcessId);
 
+    //
+    // unlink this process from its parent's child_list.  if parent_proc
+    // is NULL or the link was already removed, the operations are no-ops.
+    //
+
+    if (proc && proc->parent_proc) {
+        RemoveEntryList(&proc->parent_link);
+        proc->parent_proc = NULL;
+    }
+
     ExReleaseResourceLite(Process_ListLock);
     KeLowerIrql(irql);
 
@@ -1602,6 +1639,12 @@ _FX void Process_Delete(HANDLE ProcessId)
             Mem_Free(proc, sizeof(PROCESS));
 
         else {
+
+            //
+            // issue #5476: resume children still suspended for SbieDll.
+            //
+
+            Process_ResumeSuspendedChildren(proc);
 
             //
             // process was found to be sandboxed:  it was already unlinked
@@ -1628,6 +1671,70 @@ _FX void Process_Delete(HANDLE ProcessId)
             Token_ReleaseProcess(proc);
 
             Pool_Delete(proc->pool);
+        }
+    }
+}
+
+
+//---------------------------------------------------------------------------
+// Process_ResumeSuspendedChildren
+//---------------------------------------------------------------------------
+
+
+//
+// issue #5476: SbieSvc can no longer resume the child once the parent
+// is gone, so the driver does it.  the parent has been removed from
+// Process_Map, so no new children can be linked to it.
+//
+
+static void Process_ResumeSuspendedChildren(PROCESS *parent)
+{
+    LIST_ENTRY resume_list;
+    KIRQL irql;
+    LIST_ENTRY *entry;
+
+    InitializeListHead(&resume_list);
+
+    //
+    // detach every child and queue the still-suspended ones for resume.
+    // the resume itself must run without Process_ListLock held, so we
+    // collect the candidates under the lock and resume them after.
+    //
+
+    KeRaiseIrql(APC_LEVEL, &irql);
+    ExAcquireResourceExclusiveLite(Process_ListLock, TRUE);
+
+    while (! IsListEmpty(&parent->child_list)) {
+
+        entry = parent->child_list.Flink;
+        PROCESS *child = CONTAINING_RECORD(entry, PROCESS, parent_link);
+
+        RemoveEntryList(entry);
+        InitializeListHead(entry);
+        child->parent_proc = NULL;
+
+        if (child->sbiedll_loaded || child->terminated)
+            continue;
+
+        InsertTailList(&resume_list, &child->parent_link);
+    }
+
+    ExReleaseResourceLite(Process_ListLock);
+    KeLowerIrql(irql);
+
+    while (! IsListEmpty(&resume_list)) {
+
+        entry = resume_list.Flink;
+        PROCESS *child = CONTAINING_RECORD(entry, PROCESS, parent_link);
+
+        RemoveEntryList(entry);
+        InitializeListHead(entry);
+
+        PEPROCESS EProcess = NULL;
+        if (NT_SUCCESS(PsLookupProcessByProcessId(child->pid, &EProcess))) {
+
+            PsResumeProcess(EProcess);
+            ObDereferenceObject(EProcess);
         }
     }
 }

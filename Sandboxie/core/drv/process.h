@@ -56,6 +56,20 @@ struct _PROCESS {
     HANDLE pid;
     HANDLE starter_id;
 
+    //
+    // parent/children tracking for issue #5476.  parent_proc is the
+    // sandboxed parent; the child unlinks itself on first SbieApi.
+    // when the parent dies, the driver resumes each child still on
+    // child_list so it does not stay suspended in Wait:Suspended.
+    //
+    // parent_proc is a borrowed pointer, only safe to dereference while
+    // Process_ListLock is held.
+    //
+
+    PROCESS *parent_proc;
+    LIST_ENTRY child_list;
+    LIST_ENTRY parent_link;
+
     // process pool.  created on process creation.  it is freed in its
     // entirety when the process terminates
 

@@ -223,10 +223,30 @@ _FX NTSTATUS Process_Api_Query(PROCESS *proc, ULONG64 *parms)
         proc->sbiedll_loaded = TRUE;
 
         //
+        // issue #5476: unlink from parent child_list on first SbieApi.
+        // Process_ListLock is not held here, so acquire it.
+        //
+
+        if (proc->parent_proc) {
+
+            KIRQL irql2;
+            KeRaiseIrql(APC_LEVEL, &irql2);
+            ExAcquireResourceExclusiveLite(Process_ListLock, TRUE);
+
+            if (proc->parent_proc) {
+                RemoveEntryList(&proc->parent_link);
+                proc->parent_proc = NULL;
+            }
+
+            ExReleaseResourceLite(Process_ListLock);
+            KeLowerIrql(irql2);
+        }
+
+        //
         // On windows 10 it was observed that the PCA service is assigning its job 
         // after sandboxie's job was already assigned, so we re check here,
         // and when needed restart the process from the sbiedll outside a PCA job.
-        //
+        // 
 
         if (proc->forced_process && Driver_OsVersion >= DRIVER_WINDOWS_10) {
 
